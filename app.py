@@ -555,10 +555,13 @@ def visit_server(sb) -> (bool, dict):
 
     match = re.search(r'/servers/(\d+)', href)
     if not match:
-        return False, {"error": f"无法从 href 解析服务器 ID: {href}"}
+        # 🆕 修改：日志脱敏，href 细节只进 TG 推送
+        return False, {"error": "无法从卡片 href 解析服务器 ID",
+                       "error_tg": f"无法从 href 解析服务器 ID: {href}"}
     server_id = match.group(1)
 
-    print(f"🖱️ 点击服务器卡片 (ID: {server_id})")
+    # 🆕 修改：日志脱敏——Actions 日志不打印服务器 ID/名称（防平台识别拉黑），TG 推送仍带完整信息
+    print("🖱️ 点击服务器卡片")
     card.click()
     time.sleep(3)
 
@@ -569,7 +572,10 @@ def visit_server(sb) -> (bool, dict):
             break
         time.sleep(1)
     else:
-        return False, {"server_id": server_id, "error": f"跳转后 URL 不匹配，当前: {sb.get_current_url()}"}
+        # error 给日志用（脱敏）；error_tg 给推送用（含当前 URL，便于排查）
+        return False, {"server_id": server_id,
+                       "error": "跳转后 URL 不匹配",
+                       "error_tg": f"跳转后 URL 不匹配，当前: {sb.get_current_url()}"}
 
     page_title = sb.get_title() or ""
     server_name = ""
@@ -578,7 +584,7 @@ def visit_server(sb) -> (bool, dict):
     else:
         server_name = f"ID {server_id}"
 
-    print(f"✅ 成功访问服务器: {server_name} (ID: {server_id})")
+    print("✅ 成功访问服务器")
     return True, {"server_id": server_id, "server_name": server_name}
 
 # 🆕 修改：单账号流程新增 node_link / proxy_label 入参——
@@ -621,8 +627,8 @@ def run_account(base_kwargs, acc, node_link, proxy_label) -> bool:
                     return True
                 else:
                     error_msg = info.get('error', '未知错误')
-                    print(f"❌ 访问服务器失败: {error_msg}")
-                    extra = f"错误: {error_msg}"
+                    print(f"❌ 访问服务器失败: {error_msg}")   # 日志只打脱敏版
+                    extra = f"错误: {info.get('error_tg', error_msg)}"   # 🆕 推送用详细版
                     if 'server_id' in info:
                         extra += f"\n服务器ID: {info['server_id']}"
                     extra += f"\n🌐 出口: {proxy_label}"

@@ -3,6 +3,7 @@
 
 import os
 import time
+import socket
 import subprocess
 import requests
 import re
@@ -15,11 +16,11 @@ PASSWORD     = os.environ.get("LUNES_PASSWORD") or ""  # 登录密码（账号1�
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""      # chat id,可选
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""    # bot token,可选
 
-# 🆕 新增：账号2 环境变量（可选；不配置时自动跳过，行为与单账号版一致）
+# 账号2 环境变量（可选；不配置时自动跳过，行为与单账号版一致）
 EMAIL1       = os.environ.get("LUNES_EMAIL1") or ""    # 登录邮箱（账号2）
 PASSWORD1    = os.environ.get("LUNES_PASSWORD1") or "" # 登录密码（账号2）
 
-# 🆕 新增：账号列表——只收集「邮箱+密码都齐全」的账号，main 里依次执行
+# 账号列表——只收集「邮箱+密码都齐全」的账号，main 里依次执行
 ACCOUNTS = []
 if EMAIL and PASSWORD:
     ACCOUNTS.append({"name": "账号1", "email": EMAIL,  "password": PASSWORD,  "shot": "acc1", "flag": "🇺🇸"})
@@ -28,7 +29,11 @@ if EMAIL1 and PASSWORD1:
 
 LOGIN_URL = "https://betadash.lunes.host/login?next=/"
 
-# 🆕 新增：邮箱掩码抽成独立函数（原内联在 send_tg_message 中且读全局 EMAIL，多账号需各自掩码）
+PROXY_LOCAL  = "http://127.0.0.1:1081"   # sing-box 本地监听地址
+PROXY_PORT   = 1081
+SETUP_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setup_proxy.sh")
+
+# 邮箱掩码
 def mask_email(email: str) -> str:
     if '@' in email:
         name, domain = email.split('@', 1)
@@ -40,7 +45,6 @@ def mask_email(email: str) -> str:
         return email[:2] + '****'
 
 #  Telegram 推送
-# 🆕 修改：新增 email / name / flag 入参（原函数读取全局 EMAIL），推送文案带账号标识与国旗
 def send_tg_message(status_icon, status_text, extra_text="", email="", name="", flag="🇺🇸"):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
@@ -49,12 +53,12 @@ def send_tg_message(status_icon, status_text, extra_text="", email="", name="", 
     local_time = time.gmtime(time.time() + 8 * 3600)
     current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
 
-    masked_email = mask_email(email)  # 🆕 修改：改为按传入账号各自掩码
+    masked_email = mask_email(email)
 
     text = (
         f"{flag} Lunes 保活通知\n\n"
         f"{status_icon} {status_text}\n"
-        f"👤 登录账户: {name} {masked_email}\n"   # 🆕 修改：加上「账号N」标识，区分推送来源
+        f"👤 登录账户: {name} {masked_email}\n"
         f"⏱️ 登录时间: {current_time_str}"
     )
     if extra_text:
@@ -71,6 +75,59 @@ def send_tg_message(status_icon, status_text, extra_text="", email="", name="", 
             print(f"  ⚠️ Telegram 通知发送失败: {r.text}")
     except Exception as e:
         print(f"  ⚠️ Telegram 通知发送异常: {e}")
+
+# ============ 🆕 多节点代理管理 ============
+# NODE_LINK 支持多行（一行一个节点）：
+#   0 行        → 全部直连（原逻辑）
+#   1 行        → 账号1、账号2 都走该节点
+#   2 行        → 账号1 走第1行，账号2 走第2行
+#   3 行及以上  → 只取前 2 行，多余忽略
+def parse_node_links():
+    raw = os.environ.get("NODE_LINK") or ""
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if len(lines) > 2:
+        print(f"ℹ️ NODE_LINK 共 {len(lines)} 行，只取前 2 行，其余忽略。")
+    return lines[:2]
+
+# 按账号序号分配节点，返回 (节点链接 or None, 展示标签)
+def assign_node(nodes, idx):
+    if not nodes:
+        return None, "直连"
+    if len(nodes) == 1:
+        return nodes[0], "节点1"
+    if idx < len(nodes):
+        return nodes[idx], f"节点{idx + 1}"
+    return nodes[-1], f"节点{len(nodes)}"
+
+def stop_singbox():
+    # 杀掉残留 sing-box，避免上一个账号的节点串到下一个账号
+    subprocess.run(["pkill", "-f", "sing-box"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+
+def start_singbox(node_link: str) -> bool:
+    stop_singbox()
+    if not os.path.exists(SETUP_SCRIPT):
+        print(f"⚠️ 未找到 {SETUP_SCRIPT}，无法启动代理")
+        return False
+    env = os.environ.copy()
+    env["NODE_LINK"] = node_link   # 只把本账号分到的那一行传给安装脚本
+    print("🔗 启动 sing-box 代理...")
+    try:
+        subprocess.run(["bash", SETUP_SCRIPT], env=env, timeout=180)
+    except Exception as e:
+        print(f"⚠️ setup_proxy.sh 执行异常: {e}")
+    # 轮询等待本地端口就绪
+    for _ in range(20):
+        try:
+            with socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=1):
+                print(f"✅ sing-box 已就绪 (127.0.0.1:{PROXY_PORT})")
+                return True
+        except OSError:
+            time.sleep(1)
+    print(f"⚠️ 等待 sing-box 端口 {PROXY_PORT} 超时")
+    return False
+# ============ 多节点代理管理 END ============
 
 #  js注入脚本
 _EXPAND_JS = """
@@ -242,8 +299,6 @@ def handle_turnstile(sb) -> bool:
     print("  ❌ Turnstile 6 次均失败")
     return False
 
-# 🆕 修改：login 由读全局 EMAIL/PASSWORD 改为参数传入 (email, password)；
-#           新增 shot 参数，截图文件名带账号后缀，避免两个账号互相覆盖
 def login(sb, email: str, password: str, shot: str) -> bool:
     print(f"🌐 打开登录页面: {LOGIN_URL}")
     sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
@@ -272,7 +327,7 @@ def login(sb, email: str, password: str, shot: str) -> bool:
             page_title = sb.get_title() or ""
             print(f"  当前 URL: {cur_url}")
             print(f"  当前标题: {page_title}")
-            sb.save_screenshot(f"login_load_fail_{shot}.png")   # 🆕 修改：文件名带账号后缀
+            sb.save_screenshot(f"login_load_fail_{shot}.png")
             return False
 
     print("🍪 关闭可能的 Cookie 弹窗...")
@@ -286,17 +341,17 @@ def login(sb, email: str, password: str, shot: str) -> bool:
         pass
 
     print(f"📧 填写邮箱...")
-    js_fill_input(sb, 'input[name="email"]', email)     # 🆕 修改：使用传入的账号
+    js_fill_input(sb, 'input[name="email"]', email)
     time.sleep(0.3)
 
     print("🔑 填写密码...")
-    js_fill_input(sb, 'input[name="password"]', password)  # 🆕 修改：使用传入的密码
+    js_fill_input(sb, 'input[name="password"]', password)
     time.sleep(1)
 
     if sb.execute_script(_EXISTS_JS):
         if not handle_turnstile(sb):
             print("❌ 登录界面的 Turnstile 验证失败")
-            sb.save_screenshot(f"login_turnstile_fail_{shot}.png")   # 🆕 修改：文件名带账号后缀
+            sb.save_screenshot(f"login_turnstile_fail_{shot}.png")
             return False
     else:
         print("ℹ️ 未检测到 Turnstile")
@@ -319,7 +374,7 @@ def login(sb, email: str, password: str, shot: str) -> bool:
         return True
 
     print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
-    sb.save_screenshot(f"login_failed_{shot}.png")   # 🆕 修改：文件名带账号后缀
+    sb.save_screenshot(f"login_failed_{shot}.png")
     return False
 
 # 访问服务器页面
@@ -368,13 +423,26 @@ def visit_server(sb) -> (bool, dict):
     print(f"✅ 成功访问服务器: {server_name} (ID: {server_id})")
     return True, {"server_id": server_id, "server_name": server_name}
 
-# 🆕 新增：单账号完整流程（登录 → 访问服务器 → TG 推送）
-#           每个账号独立浏览器会话（cookie 隔离），异常就地捕获，不拖垮其他账号
-def run_account(sb_kwargs, acc) -> bool:
+# 🆕 修改：单账号流程新增 node_link / proxy_label 入参——
+#           启动浏览器前先用本账号分到的节点重启 sing-box，结束后再杀掉
+def run_account(base_kwargs, acc, node_link, proxy_label) -> bool:
     name = acc["name"]
     print("\n" + "#" * 25)
     print(f"   Lunes 自动登录续期 - {name}")
     print("#" * 25)
+
+    sb_kwargs = dict(base_kwargs)   # 🆕 复制一份，避免代理配置串到其他账号
+
+    # 🆕 新增：按节点启动本账号专属代理；启动失败则降级直连
+    if node_link:
+        print(f"🌐 {name} 分配出口: {proxy_label}")
+        if start_singbox(node_link):
+            sb_kwargs["proxy"] = PROXY_LOCAL
+        else:
+            proxy_label = f"{proxy_label}(启动失败,降级直连)"
+            print(f"⚠️ {name} 代理启动失败，本账号走直连")
+    else:
+        print(f"🌐 {name} 未分配节点，直连访问")
 
     try:
         with SB(**sb_kwargs) as sb:
@@ -388,7 +456,9 @@ def run_account(sb_kwargs, acc) -> bool:
             if login(sb, acc["email"], acc["password"], acc["shot"]):
                 success, info = visit_server(sb)
                 if success:
-                    extra = f"服务器: {info['server_name']}\nID: {info['server_id']}"
+                    extra = (f"服务器: {info['server_name']}\n"
+                             f"ID: {info['server_id']}\n"
+                             f"🌐 出口: {proxy_label}")
                     send_tg_message("✅", "续期成功", extra, email=acc["email"], name=name, flag=acc["flag"])
                     return True
                 else:
@@ -397,45 +467,52 @@ def run_account(sb_kwargs, acc) -> bool:
                     extra = f"错误: {error_msg}"
                     if 'server_id' in info:
                         extra += f"\n服务器ID: {info['server_id']}"
+                    extra += f"\n🌐 出口: {proxy_label}"
                     send_tg_message("❌", "续期失败", extra, email=acc["email"], name=name, flag=acc["flag"])
                     return False
             else:
                 print(f"\n❌ {name} 登录失败，终止该账号后续续期操作。")
-                send_tg_message("❌", "登录失败", "", email=acc["email"], name=name, flag=acc["flag"])
+                send_tg_message("❌", "登录失败", f"🌐 出口: {proxy_label}",
+                                email=acc["email"], name=name, flag=acc["flag"])
                 return False
     except Exception as e:
-        # 🆕 新增：浏览器启动失败等未预期异常兜底，推送后继续下一个账号
         print(f"❌ {name} 执行出现异常: {e}")
-        send_tg_message("❌", "执行异常", f"错误: {e}", email=acc["email"], name=name, flag=acc["flag"])
+        send_tg_message("❌", "执行异常", f"错误: {e}\n🌐 出口: {proxy_label}",
+                        email=acc["email"], name=name, flag=acc["flag"])
         return False
+    finally:
+        # 🆕 新增：无论成败，杀掉本账号的 sing-box，避免节点串号
+        if node_link:
+            stop_singbox()
 
 def main():
-    # 🆕 修改：代理与浏览器参数保留在 main 统一配置，流程改为逐账号循环
-    is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     sb_kwargs = {"uc": True, "headless": False}
 
-    if is_proxy:
-        proxy_str = "http://127.0.0.1:1081"
-        print(f"🔗 挂载sing-box代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
+    # 🆕 修改：代理来源改为解析 NODE_LINK 多行节点（优先级最高）
+    nodes = parse_node_links()
+    if nodes:
+        print(f"🔗 NODE_LINK 检测到 {len(nodes)} 个有效节点。")
     else:
-        print("🌐 未使用代理，直连访问")
+        # 兼容旧逻辑：外部已自行在 1081 起好代理时，可用 IS_PROXY=true 挂载
+        is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
+        if is_proxy:
+            print(f"🔗 未配置 NODE_LINK，沿用 IS_PROXY 旧逻辑: {PROXY_LOCAL}")
+            sb_kwargs["proxy"] = PROXY_LOCAL
+        else:
+            print("🌐 未配置 NODE_LINK 代理，直连访问")
 
-    # 🆕 新增：无可用账号时直接退出，避免静默空跑
     if not ACCOUNTS:
         print("❌ 未配置任何账号（LUNES_EMAIL/LUNES_PASSWORD 均为空），退出。")
         return
 
     print(f"📋 共配置 {len(ACCOUNTS)} 个账号，依次执行。")
 
-    # 🆕 新增：逐账号执行（各自独立浏览器会话），末尾汇总结果
     results = []
     for idx, acc in enumerate(ACCOUNTS):
-        ok = run_account(sb_kwargs, acc)
+        node, label = assign_node(nodes, idx)   # 🆕 每个账号领自己的节点
+        ok = run_account(sb_kwargs, acc, node, label)
         results.append((acc["name"], ok))
         if idx < len(ACCOUNTS) - 1:
-            # 🆕 修改：账号间由固定 3 秒改为随机 1~3 分钟，模拟真人操作间隔，降低黑号风险
-            #          （推送在 run_account 内已完成，此处等待后再执行下一账号）
             wait_seconds = random.randint(60, 180)
             print(f"\n⏳ 随机等待 {wait_seconds} 秒（约 {wait_seconds / 60:.1f} 分钟）后执行下一账号，避免多账号行为过于规律...")
             time.sleep(wait_seconds)

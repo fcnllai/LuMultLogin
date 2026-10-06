@@ -1,6 +1,7 @@
-## 🚀 lunes host 自动登录续期（GitHub Actions）
+## 🚀 Lunes Host 自动登录续期（GitHub Actions）
 
-这是一个基于 GitHub Actions 的多账号自动化脚本，用于定时登录自动续期[lunes host](https://betadash.lunes.host/) 应用。
+这是一个基于 GitHub Actions 的多账号自动化脚本，用于定时登录自动续期[Lunes Host](https://betadash.lunes.host/) 应用。
+模拟人工登录模式，在原脚本基础上优化了第2账号登录方式，防止黑号。
 
 ⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点 
 

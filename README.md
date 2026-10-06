@@ -1,12 +1,15 @@
 ## 🚀 Lunes Host 多账号自动登录续期（GitHub Actions）
 
 这是一个基于 GitHub Actions 的多账号自动化脚本，用于定时登录自动续期[Lunes Host](https://betadash.lunes.host/) 应用。
+优化列表：
 
-模拟人工登录模式，在原脚本基础上优化了第2账号登录方式，防止黑号。
-NODE_LINK代理链接支持多行，空行直连，第1行账号1，第2行账号2，仅1行两账号共用，超过2行的直接忽略。
-支持代理协议 vless:// vmess:// tuic:// hysteria2:// anttls:// socks5://， github不支持纯ipv6
+1.模拟人工登录模式，在原脚本基础上增加和优化了第2账号登录方式，防止黑号。
 
-⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点 
+2.NODE_LINK代理链接支持多行，空行直连，第1行账号1，第2行账号2，仅1行两账号共用，超过2行的直接忽略。
+
+3.支持代理协议 vless:// vmess:// tuic:// hysteria2:// anttls:// socks5://， github不支持纯ipv6，增加签到前的代理检查并输出状态日志。
+
+⚠️ 有Cloudflare盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -36,4 +39,4 @@ NODE_LINK代理链接支持多行，空行直连，第1行账号1，第2行账�
 - **SOCKS5**：`socks5://user:pass@server:port` 或 `socks://user:pass@server:port`
 
 ### 注意事项
-- 尽量添加一个干净的节点，以免过不了cf盾
+- 尽量添加一个干净的节点，以免过不了Cloudflare盾

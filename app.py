@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import json
 import time
 import socket
 import subprocess
@@ -99,13 +100,145 @@ def assign_node(nodes, idx):
         return nodes[idx], f"节点{idx + 1}"
     return nodes[-1], f"节点{len(nodes)}"
 
+# setup_proxy.sh 支持的协议（2026-10 核对该脚本源码确认，不支持 ss://）
+SUPPORTED_PROTOS = {"vless", "vmess", "trojan", "hysteria2", "hy2", "tuic", "anytls", "socks5", "socks"}
+
+def node_proto(link: str) -> str:
+    return link.split("://", 1)[0].split(":", 1)[0].strip().lower()
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
 def stop_singbox():
     # 杀掉残留 sing-box，避免上一个账号的节点串到下一个账号
     subprocess.run(["pkill", "-f", "sing-box"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
+    # 🆕 修改：等端口真正释放（最多 5 秒），避免新 sing-box 绑不上 1081
+    for _ in range(10):
+        if not _port_open(PROXY_PORT):
+            return
+        time.sleep(0.5)
+
+# 🆕 新增：通过本地代理发真实请求，确认节点真的可用（仅端口通不算数）
+def verify_proxy() -> bool:
+    try:
+        r = requests.get("https://api.ip.sb/ip",
+                         proxies={"http": PROXY_LOCAL, "https": PROXY_LOCAL},
+                         timeout=15)
+        if r.status_code == 200:
+            print(f"✅ 代理实测可用，出口 IP: {r.text.strip()}")
+            return True
+        print(f"⚠️ 代理实测返回 HTTP {r.status_code}")
+    except Exception as e:
+        print(f"⚠️ 代理实测失败: {e}")
+    return False
+
+def _print_file_tail(path: str, n: int = 20):
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+        for line in lines[-n:]:
+            print(f"    {line.rstrip()}")
+    except Exception:
+        pass
+
+# 🆕 新增：IPv4 强制重试——GitHub Actions runner 无 IPv6 出口，
+#           hy2/tuic 等 UDP 节点域名若解析到 AAAA 会 dial 失败 (network is unreachable)。
+#           做法：把配置里的服务器域名解析成 A 记录（IPv4 字面量）写回配置，自行重启 sing-box。
+def retry_singbox_ipv4() -> bool:
+    script_dir = os.path.dirname(SETUP_SCRIPT)
+    cfg_path   = os.path.join(script_dir, "sing-box-config.json")
+    bin_path   = os.path.join(script_dir, "sing-box")
+    log_path   = os.path.join(script_dir, "sing-box.log")
+    if not (os.path.exists(cfg_path) and os.path.exists(bin_path)):
+        print("⚠️ 未找到 sing-box 配置或二进制，无法 IPv4 重试")
+        return False
+    try:
+        with open(cfg_path) as f:
+            conf = json.load(f)
+    except Exception as e:
+        print(f"⚠️ 读取 sing-box 配置失败: {e}")
+        return False
+
+    changed = False
+    for ob in conf.get("outbounds", []):
+        server = ob.get("server", "")
+        if not server:
+            continue
+        # 已是 IPv4 字面量则无需改写
+        try:
+            socket.inet_pton(socket.AF_INET, server)
+            continue
+        except OSError:
+            pass
+        # IPv6 字面量在 Actions 上无路由，改不了
+        try:
+            socket.inet_pton(socket.AF_INET6, server)
+            print(f"⚠️ 节点服务器是 IPv6 字面量 {server}，runner 无 IPv6 出口，无法重试")
+            continue
+        except OSError:
+            pass
+        try:
+            ipv4 = socket.getaddrinfo(server, None, socket.AF_INET)[0][4][0]
+        except OSError as e:
+            print(f"⚠️ 解析 {server} 的 A 记录失败: {e}")
+            continue
+        print(f"🔧 强制 IPv4: {server} → {ipv4}")
+        ob["server"] = ipv4   # tls.server_name 已在配置里是原域名/SNI，不受影响
+        changed = True
+
+    if not changed:
+        print("⚠️ 配置无需改写（或改写失败），跳过重试")
+        return False
+
+    try:
+        with open(cfg_path, "w") as f:
+            json.dump(conf, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ 写回配置失败: {e}")
+        return False
+
+    stop_singbox()
+    print("🔧 以 IPv4 配置重启 sing-box...")
+    try:
+        log_file = open(log_path, "w")
+        subprocess.Popen([bin_path, "run", "-c", cfg_path],
+                         cwd=script_dir, stdout=log_file, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    except Exception as e:
+        print(f"⚠️ 重启 sing-box 失败: {e}")
+        return False
+
+    for _ in range(10):
+        if _port_open(PROXY_PORT):
+            break
+        time.sleep(1)
+    else:
+        print("❌ IPv4 重试后端口未监听，sing-box.log 末尾：")
+        _print_file_tail(log_path)
+        return False
+
+    for _ in range(3):
+        if verify_proxy():
+            print("✅ IPv4 强制重试成功")
+            return True
+        time.sleep(2)
+    print("❌ IPv4 重试后代理仍不可用，sing-box.log 末尾：")
+    _print_file_tail(log_path)
+    return False
 
 def start_singbox(node_link: str) -> bool:
+    # 🆕 新增：前置协议校验——setup_proxy.sh 不支持 ss:// 等协议，直接判失败，不白跑 1~3 分钟
+    proto = node_proto(node_link)
+    print(f"🔎 节点协议: {proto}")
+    if proto not in SUPPORTED_PROTOS:
+        print(f"❌ setup_proxy.sh 不支持协议 [{proto}]（支持: vless/vmess/trojan/hysteria2/tuic/anytls/socks5），本账号降级直连")
+        return False
+
     stop_singbox()
     if not os.path.exists(SETUP_SCRIPT):
         print(f"⚠️ 未找到 {SETUP_SCRIPT}，无法启动代理")
@@ -113,18 +246,43 @@ def start_singbox(node_link: str) -> bool:
     env = os.environ.copy()
     env["NODE_LINK"] = node_link   # 只把本账号分到的那一行传给安装脚本
     print("🔗 启动 sing-box 代理...")
+
+    # 🆕 修改：捕获脚本输出并检查返回码——失败时把脚本输出和 sing-box.log 打出来，排查不再抓瞎
     try:
-        subprocess.run(["bash", SETUP_SCRIPT], env=env, timeout=180)
+        proc = subprocess.run(["bash", SETUP_SCRIPT], env=env, timeout=240,
+                              capture_output=True, text=True)
+        script_out = (proc.stdout or "") + (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        print("❌ setup_proxy.sh 执行超时（240s）")
+        return False
     except Exception as e:
         print(f"⚠️ setup_proxy.sh 执行异常: {e}")
-    # 轮询等待本地端口就绪
-    for _ in range(20):
-        try:
-            with socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=1):
-                print(f"✅ sing-box 已就绪 (127.0.0.1:{PROXY_PORT})")
+        return False
+
+    if proc.returncode != 0:
+        print(f"❌ setup_proxy.sh 返回码 {proc.returncode}，脚本输出如下：")
+        for line in script_out.strip().splitlines()[-25:]:
+            print(f"    {line}")
+        log_path = os.path.join(os.path.dirname(SETUP_SCRIPT), "sing-box.log")
+        if os.path.exists(log_path):
+            print("  ---- sing-box.log 末尾 ----")
+            _print_file_tail(log_path)
+        # 🆕 新增：UDP 节点解析到 IPv6 是 Actions 上最常见的死法，强制 IPv4 重试一次
+        print("🔧 尝试强制 IPv4 重试（Actions 无 IPv6 出口，UDP 节点解析到 AAAA 会 network unreachable）...")
+        if retry_singbox_ipv4():
+            return True
+        return False
+
+    # 轮询等待本地端口就绪（脚本返回 0 时 sing-box 已在后台运行，正常应立即可通）
+    for _ in range(10):
+        if _port_open(PROXY_PORT):
+            print(f"✅ sing-box 已就绪 (127.0.0.1:{PROXY_PORT})")
+            # 🆕 新增：端口通不代表节点可用，再发真实代理请求实测
+            if verify_proxy():
                 return True
-        except OSError:
-            time.sleep(1)
+            print("❌ 代理端口已监听但实测不通（节点可能已失效）")
+            return False
+        time.sleep(1)
     print(f"⚠️ 等待 sing-box 端口 {PROXY_PORT} 超时")
     return False
 # ============ 多节点代理管理 END ============

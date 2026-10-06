@@ -30,12 +30,11 @@ jobs:
           pip install seleniumbase aiohttp requests
           seleniumbase install chromedriver
 
-      - name: 🌐 设置sing-box代理转发
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}   # 在 secret 里设置 NODE_LINK 代理启用代理
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+      # 🆕 修改：原「设置sing-box代理转发」步骤改为只下载安装脚本。
+      # 真正的 sing-box 启动改由 app.py 按账号逐节点调用本脚本完成：
+      #   NODE_LINK 第1行 → 账号1，第2行 → 账号2；仅1行则共用；为空则直连。
+      - name: 📥 下载 sing-box 安装脚本
+        run: wget -qO setup_proxy.sh https://main.ssss.nyc.mn/setup_proxy.sh
 
       - name: 🚀 运行续期脚本
         env:
@@ -43,11 +42,22 @@ jobs:
           LUNES_PASSWORD: ${{ secrets.LUNES_PASSWORD }}
           LUNES_EMAIL1: ${{ secrets.LUNES_EMAIL1 }}       # 账号2（可选，不配则自动跳过）
           LUNES_PASSWORD1: ${{ secrets.LUNES_PASSWORD1 }} # 账号2 密码
+          # 🆕 修改：NODE_LINK 支持多行节点（一行一个），直接在 secret 里换行填写。
+          #   2 行 → 账号1 用第1行、账号2 用第2行
+          #   1 行 → 账号1、账号2 共用该节点
+          #   3 行及以上 → 只取前 2 行，多余忽略
+          #   留空/不配置 → 全部直连
+          NODE_LINK: ${{ secrets.NODE_LINK }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
           python3 app.py
+
+      # 兜底：清理可能残留的 sing-box 进程
+      - name: 🧹 清理 sing-box 进程
+        if: always()
+        run: pkill -f sing-box || true
 
       # 更新时间到 time.txt，避免仓库长期无活动导致 schedule 被自动停用
       # （60 天无活动自动禁用只针对 public 仓库；private 仓库无此限制）
